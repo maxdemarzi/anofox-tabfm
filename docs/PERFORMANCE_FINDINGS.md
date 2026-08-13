@@ -129,3 +129,93 @@ they are not, and load is the reported symptom.
 
 Caveat: this trades away wake-up latency, so a workload of many tiny
 back-to-back `Run()` calls could regress. Neither shape here did.
+
+---
+
+# Round 2 — the cold path
+
+The above profiles the **warm** path only. `PERFORMANCE_TUNING.md` says to report
+COLD and WARM separately, and the two turn out to be entirely different queries.
+
+## Cold is 30x warm, before any model is big
+
+Three identical `tabfm_classify` calls in one process, 103 KB fixture:
+
+| call | time |
+|---|---:|
+| 1st (loads the model) | 122 ms |
+| 2nd | 6 ms |
+| 3rd | 4 ms |
+
+The load is **30x** a warm call, and that is against a 103 KB fixture. The real
+`tabicl-v2` is 110 MB and `PERFORMANCE_PLAN.md`'s reference model is 6.6 GB.
+
+Profiling this needs care: 25 fresh processes attribute almost everything to
+process startup and `libonnxruntime` does not even appear. Registering the same
+fixture under 40 distinct ids forces 40 real loads inside **one** process (~97 ms
+each, reproducible), which is what the numbers below profile.
+
+## The load path is 57% DuckDB scheduler and 0.06% us
+
+```
+27.4%  libonnxruntime.so.1.23.2        (session creation — real work)
+57.2%  DuckDB executor + mutex + malloc
+       pthread_mutex_lock 10.1%, PendingQueryResult::CheckExecutableInternal 7.4%,
+       Executor::ExecuteTask 6.8%, PendingQueryResult::ExecuteInternal 6.5%,
+       _int_free 4.6%, _int_malloc 3.0%, malloc 2.9%, ...
+ 0.06% duckdb::anofox::*  (ParseModelSpec, LoadOrGetSession, ResolveModel)
+```
+
+That 57% is DuckDB's worker threads polling while one task blocks. `Predict()`
+loads the model inside the aggregate's **finalize** — a task — under the device
+mutex (`tabfm_engine.cpp:871`), so for the whole load every other worker spins.
+
+Varying DuckDB's own `SET threads` over 40 loads:
+
+| `SET threads` | total real | total user |
+|---:|---:|---:|
+| 1 | 3.77 s | 3.68 s |
+| 2 | 3.77 s | 3.90 s |
+| 4 | 3.86 s | 6.78 s |
+| 8 | 3.89 s | 6.83 s |
+
+**Wall-clock is flat; CPU nearly doubles.** ~77 ms of CPU is burned per load for
+no wall-clock gain.
+
+**Control** (per "attribute a failure before explaining it"): 40 **warm** queries,
+same sweep, cost 0.15 s → 0.25 s of CPU — 2.5 ms per query of baseline
+multi-thread overhead, against 77 ms per load. The extra CPU tracks the duration
+of the blocking load, not the query count. The attribution holds.
+
+This is the same shape as the ORT spinner, one level up, and it is DuckDB's
+scheduler rather than our code. The lever we own is *not blocking a task thread
+for the length of a model load* — which is a real architectural change (load at
+bind, or asynchronously), justified by CPU rather than wall-clock. Not attempted
+here.
+
+## `tabfm_load` cannot preload a registered model
+
+The obvious mitigation — take the load off the query path — already has a
+surface: `CALL tabfm_load('classification', model := 'x')`. It rejects a model
+registered with `tabfm_register_model(base_dir := ...)`, because it checks
+whether the weights were *downloaded*. So the mitigation is unavailable for
+exactly the local models the fixtures use. Its error message also prints the
+**task** where it names the model: asking for `model := 'fixture'` reports
+`model 'classification' is not downloaded` (`tabfm_weights.cpp:705`).
+
+## Measured and not a bottleneck
+
+`tabfm_generate` (1500 rows from a 1500-row source, tabpfn fixture): **76 ms**.
+`tabfm_impute` (1500 rows, ~20% NULLs across 3 columns): **44 ms**. Neither
+shows a hot spot worth chasing at this scale.
+
+## What cannot be measured on this box
+
+The largest committed fixture weight file is 929 KB. `tabicl-v2` is 110 MB and
+the `PERFORMANCE_PLAN.md` reference model is 6.6 GB — 100x to 7000x more bytes
+through the safetensors parse, the BF16→F32 upcast and the initializer
+injection. At fixture scale that whole path is 0.06% of the profile, which
+licenses **no** conclusion about it at real scale. Anyone with a pod and real
+weights should re-run the 40-load profile there before assuming the parse is
+free; it is the one part of the cold path whose cost is genuinely proportional
+to model size.
