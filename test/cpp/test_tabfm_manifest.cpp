@@ -286,3 +286,42 @@ TEST_CASE("manifest: WS-A fixture manifest parses when present", "[tabfm][manife
 	REQUIRE(!manifest.files.empty());
 	REQUIRE(manifest.engine_profiles.count("cpu") == 1);
 }
+
+TEST_CASE("manifest: a file path may not escape the cache directory", "[tabfm][manifest]") {
+	// files[].path is joined onto <cache_dir>/<slug> to produce the path that
+	// tabfm_download WRITES and tabfm_remove DELETES. Neither call site
+	// normalises it, and the directory-pruning loop beside the delete is the only
+	// thing in that file that checks containment — so the constraint has to hold
+	// here, at the parse, where the value enters the program.
+	auto parse = [](const string &path) {
+		return ParseModelManifest(R"({"model":"m","task":"classification","repo":"a/b",)"
+		                          R"("files":[{"path":")" +
+		                              path + R"(","bytes":1}],"graph":"g",)"
+		                          R"("preprocessing_profile":"p","license":"l"})",
+		                          "bad_manifest.json");
+	};
+
+	SECTION("ordinary relative paths are accepted") {
+		REQUIRE(parse("model.safetensors").files[0].path == "model.safetensors");
+		REQUIRE(parse("classification/model.ckpt").files[0].path == "classification/model.ckpt");
+		// a dot in the name is not a traversal
+		REQUIRE(parse("model.v2.5.ckpt").files[0].path == "model.v2.5.ckpt");
+	}
+	SECTION("parent-directory components are rejected") {
+		REQUIRE_THROWS_AS(parse("../escape"), InvalidInputException);
+		REQUIRE_THROWS_AS(parse("a/../../escape"), InvalidInputException);
+		REQUIRE_THROWS_AS(parse("a/.."), InvalidInputException);
+		REQUIRE_THROWS_AS(parse(".."), InvalidInputException);
+	}
+	SECTION("absolute paths are rejected") {
+		REQUIRE_THROWS_AS(parse("/etc/passwd"), InvalidInputException);
+	}
+	SECTION("backslashes are rejected — they are separators on Windows") {
+		REQUIRE_THROWS_AS(parse("..\\\\escape"), InvalidInputException);
+		REQUIRE_THROWS_AS(parse("C:\\\\weights.bin"), InvalidInputException);
+	}
+	SECTION("the error names the manifest and the offending path") {
+		REQUIRE_THROWS_WITH(parse("../escape"),
+		                    Contains("bad_manifest.json") && Contains("../escape"));
+	}
+}

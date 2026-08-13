@@ -73,6 +73,43 @@ string GetOptionalString(yyjson_val *obj, const char *field, const string &defau
 	return string(yyjson_get_str(val), yyjson_get_len(val));
 }
 
+//! A manifest's files[].path is joined onto <cache_dir>/<slug> to form the path that
+//! tabfm_download writes and tabfm_remove deletes. Neither call site normalises it, and the
+//! only containment check in that file guards the directory pruning, not the files themselves.
+//! Constrain it here, where the value enters the program, so it cannot name anything outside
+//! the cache entry it belongs to.
+//!
+//! Today every manifest that reaches those paths is compiled into the binary
+//! (LoadModelManifestFile has no caller in src/), so this is defence in depth rather than a
+//! reachable bug — but it stops being that the moment a manifest can be supplied.
+void ValidateCacheRelativePath(const string &path, const string &manifest_path) {
+	auto reject = [&](const char *why) {
+		throw InvalidInputException("Model manifest %s: file path \"%s\" %s. Paths are relative to the "
+		                            "model's cache directory and may not point outside it.",
+		                            manifest_path, path, why);
+	};
+	if (path.front() == '/') {
+		reject("is absolute");
+	}
+	if (path.find('\\') != string::npos) {
+		// A backslash is a separator on Windows, so it can hide a traversal from a '/'-only scan.
+		reject("contains a backslash");
+	}
+	// Reject a ".." *component*, not the substring: "model.v2.5.ckpt" is a legitimate name.
+	idx_t start = 0;
+	while (start <= path.size()) {
+		auto slash = path.find('/', start);
+		const auto end = slash == string::npos ? path.size() : slash;
+		if (end - start == 2 && path[start] == '.' && path[start + 1] == '.') {
+			reject("contains a \"..\" path component");
+		}
+		if (slash == string::npos) {
+			break;
+		}
+		start = slash + 1;
+	}
+}
+
 TabFMTask ParseTask(const string &task, const string &manifest_path) {
 	if (task == "classification") {
 		return TabFMTask::CLASSIFICATION;
@@ -103,6 +140,7 @@ vector<ManifestFile> ParseFiles(yyjson_val *root, const string &manifest_path) {
 		}
 		ManifestFile file;
 		file.path = GetRequiredString(entry, "path", manifest_path);
+		ValidateCacheRelativePath(file.path, manifest_path);
 		file.url = GetOptionalString(entry, "url", "", manifest_path);
 		auto bytes_val = yyjson_obj_get(entry, "bytes");
 		if (!bytes_val) {
