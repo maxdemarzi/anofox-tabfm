@@ -348,6 +348,18 @@ void PrepareSessionOptions(Ort::SessionOptions &options, const vector<TabFMTenso
 	options.SetInterOpNumThreads(1); // inference runs inside a single DuckDB task (HLD §4.4)
 	// Prepacking speeds up matmuls at ~+16% resident memory (anofox_tabfm_cpu_prepack).
 	options.AddConfigEntry("session.disable_prepacking", config.prepack ? "0" : "1");
+	// Stop the intra-op pool busy-waiting between ops. ORT's default is to spin, which trades CPU
+	// for wake-up latency -- a good trade for a process that owns the machine, and a bad one here:
+	// DuckDB runs one session per concurrent task, so the spinners of every task contend with the
+	// threads doing the work. Measured on the reldebug cpu build, answers identical:
+	//
+	//   single query, 4000 rows x 8 features      256 ms -> 237 ms   (1.08x)
+	//   single query, 100 rows x 1000 features   1718 ms -> 1731 ms  (0.99x, within noise)
+	//   6 concurrent queries, 6 threads each    makespan 18.10 s -> 17.22 s (1.05x),
+	//                                           total CPU 93.3 s -> 85.8 s (-8%)
+	//
+	// The contended row is the one that matters: it is the shape a pod runs.
+	options.AddConfigEntry("session.intra_op.allow_spinning", "0");
 	AppendExecutionProviders(options, config);
 
 	// Wrap the caller's buffers as non-owning Ort::Values for
