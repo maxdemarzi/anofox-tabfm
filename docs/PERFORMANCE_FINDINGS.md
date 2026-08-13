@@ -219,3 +219,69 @@ licenses **no** conclusion about it at real scale. Anyone with a pod and real
 weights should re-run the 40-load profile there before assuming the parse is
 free; it is the one part of the cold path whose cost is genuinely proportional
 to model size.
+
+---
+
+# Round 3 — real weights
+
+`~/.cache/anofox-tabfm/jingang__TabICL@main` already held real **tabicl-v2**
+weights (105 MB classification, 109 MB regression, BSD-3, no token needed), so
+the two questions rounds 1 and 2 had to leave open are now answered on a real
+model rather than the fixture.
+
+Cold 330 ms / warm 30 ms, against the fixture's 122 ms / 4 ms. Note the cold path
+grew only 2.7x for 1000x the weight bytes — so the safetensors/ckpt parse is
+**not** proportional-dominant, which is the opposite of what round 2 warned might
+be true. Session creation, not byte-shovelling, is the cold cost.
+
+## The thread saturation transfers — it was not a fixture artefact
+
+Round 1 recorded "both shapes bottom out at 4 threads" as an explicit
+*hypothesis*, on the grounds that the fixture's ops might be too small to
+parallelise. It reproduces on real weights. Sweeping 1..12 on a 12-core box, so
+no setting is oversubscribed, real / user:
+
+| threads | 500 features x 100 rows | 3000 rows x 8 features |
+|---:|---|---|
+| 1 | 2.343 s / 4.37 s | 1.867 s / 3.65 s |
+| 2 | 1.733 s / 4.50 s | 1.206 s / 3.32 s |
+| 4 | **1.412 s** / 5.50 s | 0.961 s / 3.98 s |
+| 8 | 1.387 s / 8.79 s | **0.908 s** / 5.96 s |
+| 12 | 1.438 s / 11.47 s | 0.920 s / 7.24 s |
+
+Useful parallelism ends at 4-8. Past that nothing gets faster and CPU keeps
+climbing — it is a property of the graph, not of the machine.
+
+Forcing the counts a large host would pick for itself:
+
+| threads | 500 features x 100 rows | 3000 rows x 8 features |
+|---:|---|---|
+| 8 | 1.398 s / 7.49 s | 0.889 s / 5.78 s |
+| 16 | 1.462 s / 11.55 s | 0.907 s / 7.23 s |
+| 32 | 1.571 s / 12.23 s | 0.895 s / 7.29 s |
+| 64 | 1.911 s / 12.69 s | 0.916 s / 7.05 s |
+
+A 64-core host defaulting to 32 is **12% slower for 63% more CPU** than 8 on the
+wide shape. Read that second table as indicative only — 32 and 64 threads on a
+12-core box are oversubscribed at the hardware level in a way they would not be
+on a 64-core pod. The 1..12 sweep is the clean evidence, and it already shows
+saturation by 8.
+
+**Taken:** `anofox_tabfm_threads` now defaults to `min(cores/2, 8)`
+(`tabfm_settings.cpp`). Hosts with ≤16 cores are unaffected — this box still
+defaults to 6 — and the setting remains settable for a model or batch that
+scales further. It composes with `container-aware-thread-default`: that branch
+fixes *which* core count is counted, this caps what the count is allowed to
+produce. A 64-core pod goes 128 → 32 (that branch) → 8 (this one).
+
+## The spinning change holds on real weights
+
+Re-run of round 1's change against tabicl-v2, default threads:
+
+| shape | wall | CPU |
+|---|---|---|
+| 500 features x 100 rows | 1.460 → 1.491 s (0.98x) | 7.73 → 6.20 s (**1.25x**) |
+| 3000 rows x 8 features | 1.012 → 0.967 s (**1.05x**) | 5.81 → 5.17 s (**1.12x**) |
+
+Same conclusion as on the fixture: wall-clock neutral to slightly better, CPU
+down 12-25%.

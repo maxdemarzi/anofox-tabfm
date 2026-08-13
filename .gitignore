@@ -11,3 +11,6 @@ vcpkg_installed/
 __pycache__/
 *.onnx.data
 build-*/
+
+# local scratch (never commit — has held credentials)
+tmp/

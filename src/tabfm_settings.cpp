@@ -83,7 +83,24 @@ void RegisterTabfmSettings(ExtensionLoader &loader) {
 	                          "Weight cache root directory (default ~/.cache/anofox-tabfm)", LogicalType::VARCHAR,
 	                          Value("~/.cache/anofox-tabfm"));
 
-	const auto default_threads = MaxValue<int64_t>(1, static_cast<int64_t>(std::thread::hardware_concurrency()) / 2);
+	// Half the cores, but never more than kMaxDefaultThreads: the model's useful intra-op
+	// parallelism is a property of the graph, not of the machine, and measuring it on real
+	// tabicl-v2 weights (105 MB) puts it at 4-8 threads on both workload shapes. Sweeping 1..12
+	// on a 12-core box -- so never oversubscribed -- wall-clock against CPU burned:
+	//
+	//   500 features x 100 rows    1:2.34s/4.4s   4:1.41s/5.5s   8:1.39s/8.8s  12:1.44s/11.5s
+	//   3000 rows x 8 features     1:1.87s/3.6s   4:0.96s/4.0s   8:0.91s/6.0s  12:0.92s/7.2s
+	//
+	// Past 8 nothing gets faster and CPU keeps climbing. Forcing the counts a 64-core host would
+	// pick: 32 threads costs 1.57s/12.2s on the wide shape against 8 threads' 1.40s/7.5s -- 12%
+	// slower for 63% more CPU. That surplus is not idle, it is contending, which is what turns a
+	// pod with several concurrent sessions into a load average of 153 against 64 cores.
+	//
+	// Only the default is capped; anofox_tabfm_threads remains settable for anyone whose model or
+	// batch scales further, and a host with 16 or fewer cores is unaffected.
+	static constexpr int64_t kMaxDefaultThreads = 8;
+	const auto half_cores = MaxValue<int64_t>(1, static_cast<int64_t>(std::thread::hardware_concurrency()) / 2);
+	const auto default_threads = MinValue<int64_t>(half_cores, kMaxDefaultThreads);
 	config.AddExtensionOption("anofox_tabfm_threads", "ONNX Runtime intra-op thread count for CPU inference",
 	                          LogicalType::BIGINT, Value::BIGINT(default_threads), ValidateThreads);
 
