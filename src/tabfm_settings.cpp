@@ -83,18 +83,25 @@ void RegisterTabfmSettings(ExtensionLoader &loader) {
 	                          "Weight cache root directory (default ~/.cache/anofox-tabfm)", LogicalType::VARCHAR,
 	                          Value("~/.cache/anofox-tabfm"));
 
-	// Half the cores, but never more than kMaxDefaultThreads: the model's useful intra-op
-	// parallelism is a property of the graph, not of the machine, and measuring it on real
-	// tabicl-v2 weights (105 MB) puts it at 4-8 threads on both workload shapes. Sweeping 1..12
-	// on a 12-core box -- so never oversubscribed -- wall-clock against CPU burned:
+	// Half the cores, but never more than kMaxDefaultThreads: a model's useful intra-op
+	// parallelism is a property of its graph, not of the machine, and it runs out well below a
+	// large host's core count. Sweeping 1..12 on a 12-core box -- so no setting is oversubscribed
+	// -- against real weights, wall-clock / CPU burned:
 	//
-	//   500 features x 100 rows    1:2.34s/4.4s   4:1.41s/5.5s   8:1.39s/8.8s  12:1.44s/11.5s
-	//   3000 rows x 8 features     1:1.87s/3.6s   4:0.96s/4.0s   8:0.91s/6.0s  12:0.92s/7.2s
+	//   tabicl-v2   500 feat x 100 rows  1:2.34s/4.4s   4:1.41s/5.5s   8:1.39s/8.8s  12:1.44s/11.5s
+	//   tabicl-v2   3000 rows x 8 feat   1:1.87s/3.6s   4:0.96s/4.0s   8:0.91s/6.0s  12:0.92s/7.2s
+	//   tabpfn-v2-5 500 feat x 100 rows  1:5.06s/10.0s  4:2.43s/10.2s  8:2.30s/15.3s 12:2.23s/18.2s
+	//   tabpfn-v2-5 3000 rows x 8 feat   1:2.91s/2.8s   4:1.48s/6.4s   8:1.42s/9.6s  12:1.40s/12.0s
 	//
-	// Past 8 nothing gets faster and CPU keeps climbing. Forcing the counts a 64-core host would
-	// pick: 32 threads costs 1.57s/12.2s on the wide shape against 8 threads' 1.40s/7.5s -- 12%
-	// slower for 63% more CPU. That surplus is not idle, it is contending, which is what turns a
-	// pod with several concurrent sessions into a load average of 153 against 64 cores.
+	// The two architectures part company past 8, so this cap is a real trade rather than a free
+	// win: tabicl-v2 gets *slower* beyond 8, while tabpfn-v2-5 keeps gaining 1-3% for ~20% more
+	// CPU. 8 is where tabicl-v2 peaks and tabpfn-v2-5 has banked all but a few percent.
+	//
+	// What pays for those few percent is the other end of the range. Forcing the count a 64-core
+	// host would pick for itself, tabicl-v2 on the wide shape costs 1.57s/12.2s at 32 threads
+	// against 1.40s/7.5s at 8 -- 12% slower for 63% more CPU. That surplus is not idle, it is
+	// contending, which is what turns a pod running several concurrent sessions into a load
+	// average of 153 against 64 usable cores.
 	//
 	// Only the default is capped; anofox_tabfm_threads remains settable for anyone whose model or
 	// batch scales further, and a host with 16 or fewer cores is unaffected.

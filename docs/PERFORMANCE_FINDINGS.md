@@ -285,3 +285,35 @@ Re-run of round 1's change against tabicl-v2, default threads:
 
 Same conclusion as on the fixture: wall-clock neutral to slightly better, CPU
 down 12-25%.
+
+## A second architecture moderates the cap
+
+`tabpfn-v2-5` downloaded (42,935,499 bytes, gated repo, `INSTALL httpfs` first —
+the download error does not mention that prerequisite). It needed the one-time
+`tools/export_tabpfn/convert_weights.py` step, exactly as duckdb-rocket's
+`PHASE2_FINDINGS.md` §1 recorded — and the error naming the converter confirms
+the `v2026.08.11` fix works against real weights. 250/250 tensors converted.
+Cold 544 ms / warm 36 ms, against tabicl-v2's 330 / 30.
+
+Same sweep, and it does **not** behave like tabicl-v2:
+
+| threads | tabpfn 500 feat x 100 rows | tabpfn 3000 rows x 8 feat |
+|---:|---|---|
+| 1 | 5.064 s / 10.02 s | 2.909 s / 2.84 s |
+| 2 | 3.211 s / 5.81 s | 1.901 s / 3.48 s |
+| 4 | 2.427 s / 10.16 s | 1.482 s / 6.35 s |
+| 8 | 2.295 s / 15.35 s | 1.415 s / 9.57 s |
+| 12 | **2.230 s** / 18.20 s | **1.402 s** / 11.98 s |
+
+tabicl-v2 gets *slower* past 8; tabpfn-v2-5 keeps improving — but only by 2.8%
+and 0.9% from 8 to 12, for ~20-25% more CPU.
+
+So the cap is a **trade, not a free win**, and the round-3 commit message
+overstated it as "past 8 nothing gets faster" — true of tabicl-v2, not of
+tabpfn-v2-5. Corrected in the code comment. 8 remains the choice: it is where
+tabicl-v2 peaks and where tabpfn-v2-5 has banked all but a few percent, and the
+few percent buys back 20% of CPU on one model and 63% at a 64-core host's
+default on the other. Anyone running a single uncontended TabPFN query on a big
+box should raise `anofox_tabfm_threads` and will get a small win; the default is
+tuned for the contended case, which is the one that produced a load average of
+153.
