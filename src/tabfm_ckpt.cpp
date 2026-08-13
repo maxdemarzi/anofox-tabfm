@@ -70,7 +70,19 @@ unordered_map<string, ZipEntry> ReadZip(const uint8_t *buf, idx_t size) {
 		uint16_t fn_len = RdU16(buf + p + 28);
 		uint16_t extra_len = RdU16(buf + p + 30);
 		uint16_t cmt_len = RdU16(buf + p + 32);
-		uint32_t lho = RdU32(buf + p + 42); // local header offset
+		// Widen before arithmetic: these are 32- and 16-bit fields read straight out of the file,
+		// and `lho + 30` in uint32 wraps for an offset near 2^32 -- which passes a `> size` test
+		// and then reads ~4 GB out of bounds.
+		const idx_t lho = RdU32(buf + p + 42); // local header offset
+		// The record's own declared length must fit before any of it is read: fn_len is 16 bits
+		// from the file and the name below is built from it (and interpolated into the errors).
+		if (p + 46 + idx_t(fn_len) + idx_t(extra_len) + idx_t(cmt_len) > size) {
+			throw InvalidInputException(
+			    "tabfm: malformed checkpoint zip central directory (entry declares a %llu-byte record "
+			    "that runs past the end of the %llu-byte file)",
+			    static_cast<unsigned long long>(46 + idx_t(fn_len) + idx_t(extra_len) + idx_t(cmt_len)),
+			    static_cast<unsigned long long>(size));
+		}
 		string name((const char *)(buf + p + 46), fn_len);
 		if (method != 0) {
 			throw InvalidInputException("tabfm: checkpoint zip entry '%s' is compressed (only STORED supported)",
@@ -80,10 +92,10 @@ unordered_map<string, ZipEntry> ReadZip(const uint8_t *buf, idx_t size) {
 		if (lho + 30 > size || RdU32(buf + lho) != 0x04034b50) {
 			throw InvalidInputException("tabfm: malformed checkpoint zip local header for '%s'", name);
 		}
-		uint16_t l_fn = RdU16(buf + lho + 26);
-		uint16_t l_extra = RdU16(buf + lho + 28);
+		idx_t l_fn = RdU16(buf + lho + 26);
+		idx_t l_extra = RdU16(buf + lho + 28);
 		idx_t data_off = lho + 30 + l_fn + l_extra;
-		if (data_off + comp_size > size) {
+		if (data_off > size || idx_t(comp_size) > size - data_off) {
 			throw InvalidInputException("tabfm: checkpoint zip entry '%s' runs past end of file", name);
 		}
 		entries[name] = ZipEntry {buf + data_off, comp_size};
