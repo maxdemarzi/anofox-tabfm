@@ -1,9 +1,8 @@
 #include "tabfm_registration.hpp"
+#include "tabfm_cpu_budget.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/common/string_util.hpp"
-
-#include <thread>
 
 namespace duckdb {
 namespace anofox {
@@ -69,6 +68,22 @@ void ValidateMaxFeatures(ClientContext &context, SetScope scope, Value &paramete
 	ValidatePositive("anofox_tabfm_max_features", context, scope, parameter);
 }
 
+void ValidateMaxMemory(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull()) {
+		throw InvalidInputException("anofox_tabfm_max_memory cannot be NULL");
+	}
+	auto value = StringValue::Get(parameter.DefaultCastAs(LogicalType::VARCHAR));
+	if (value.empty()) {
+		return; // '' = disabled
+	}
+	idx_t bytes;
+	auto error = StringUtil::TryParseFormattedBytes(value, bytes);
+	if (!error.empty()) {
+		throw InvalidInputException(
+		    "anofox_tabfm_max_memory: %s (got '%s'); use a size like '16GB', or '' to disable", error, value);
+	}
+}
+
 } // anonymous namespace
 
 void RegisterTabfmSettings(ExtensionLoader &loader) {
@@ -83,7 +98,7 @@ void RegisterTabfmSettings(ExtensionLoader &loader) {
 	                          "Weight cache root directory (default ~/.cache/anofox-tabfm)", LogicalType::VARCHAR,
 	                          Value("~/.cache/anofox-tabfm"));
 
-	const auto default_threads = MaxValue<int64_t>(1, static_cast<int64_t>(std::thread::hardware_concurrency()) / 2);
+	const auto default_threads = MaxValue<int64_t>(1, static_cast<int64_t>(UsableCoreCount()) / 2);
 	config.AddExtensionOption("anofox_tabfm_threads", "ONNX Runtime intra-op thread count for CPU inference",
 	                          LogicalType::BIGINT, Value::BIGINT(default_threads), ValidateThreads);
 
@@ -92,6 +107,14 @@ void RegisterTabfmSettings(ExtensionLoader &loader) {
 
 	config.AddExtensionOption("anofox_tabfm_max_features", "Maximum feature columns per predict call",
 	                          LogicalType::BIGINT, Value::BIGINT(500), ValidateMaxFeatures);
+
+	config.AddExtensionOption(
+	    "anofox_tabfm_max_memory",
+	    "Refuse a predict call when this process's resident memory is already at or above this size (e.g. '16GB') "
+	    "before the call starts, so the failure is a DuckDB exception instead of a cgroup OOM-kill. '' (default) "
+	    "disables the check. Checked against resident memory at call time, not an estimate of the call's own "
+	    "cost -- it does not bound how much a single large call can grow memory by itself.",
+	    LogicalType::VARCHAR, Value(""), ValidateMaxMemory);
 
 	config.AddExtensionOption("anofox_tabfm_default_model",
 	                          "Default model id for tabfm_classify/regress/download/... when model := is not given. "
